@@ -4,11 +4,8 @@
 #SBATCH -n 1                      # Number of tasks (i.e. processes)
 #SBATCH --cpus-per-task=4         # Number of cores per task
 #SBATCH --gres=gpu:l40s:1         # Request a L40S GPU
-#SBATCH --nodelist=al-l40s-0.grasp.maas
-#SBATCH --qos=al-high-2gpu        # QoS
-#SBATCH --partition=aloque-compute
 #SBATCH -t 1-00:00                # Maximum time (24h)
-#SBATCH -D /home/lorebia/Github/isaac_quad_sim2real
+#SBATCH -D /home/gxzhao4/github/ese651_project
 
 ##SBATCH -o slurm.%N.%j.out
 ##SBATCH -e slurm.%N.%j.err

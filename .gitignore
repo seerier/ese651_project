@@ -18,3 +18,7 @@
 **/runs/*
 **/logs/*
 **/recordings/*
+
+# Slurm
+*.out
+*.err
