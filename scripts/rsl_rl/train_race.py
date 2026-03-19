@@ -106,15 +106,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_dir = os.path.join(log_root_path, log_dir)
 
     # TODO ----- START ----- Define rewards scales
-    # reward scales
-    progress_goal_reward_scale = 50.0
-    crash_reward = -1.0
+    # Gate passage: large sparse reward — the primary training signal.
+    # Each gate passed gives a substantial bonus to drive gate-seeking behavior.
+    gate_pass_reward_scale = 10.0
+
+    # Progress (potential-based shaping): reward per meter of distance reduction
+    # toward the current gate. Provides dense gradient signal between gate passages.
+    progress_goal_reward_scale = 2.0
+
+    # Velocity toward gate: reward for instantaneous speed in the gate direction.
+    # Directly incentivises fast racing rather than slow cautious approaches.
+    velocity_gate_reward_scale = 0.3
+
+    # Crash penalty: per-timestep contact-force penalty once contact is sustained.
+    crash_reward = -0.5
+
+    # Death cost: large terminal penalty applied at episode end on a fatal termination.
     death_cost = -10.0
 
     rewards = {
+        'gate_pass_reward_scale':     gate_pass_reward_scale,
         'progress_goal_reward_scale': progress_goal_reward_scale,
-        'crash_reward_scale': crash_reward,
-        'death_cost': death_cost,
+        'velocity_gate_reward_scale': velocity_gate_reward_scale,
+        'crash_reward_scale':         crash_reward,
+        'death_cost':                 death_cost,
     }
     # TODO ----- END -----
 

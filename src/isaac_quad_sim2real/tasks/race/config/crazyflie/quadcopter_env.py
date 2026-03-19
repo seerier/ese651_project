@@ -676,6 +676,19 @@ class QuadcopterEnv(DirectRLEnv):
         #TODO ----- START ----- [OPTIONAL]
         # Consider adding additional _get_dones() conditions to influence training. Note that the additional conditions
         # will not be used during runtime for the official class race.
+
+        # Terminate episodes where the drone has wandered far off-track.
+        # This cuts short hopeless trajectories, improving sample efficiency.
+        # Only activates after 2 s to avoid spurious terminations near reset.
+        dist_to_current_gate = torch.linalg.norm(self._pose_drone_wrt_gate, dim=1)
+        cond_off_track = (dist_to_current_gate > 8.0) & (episode_time > 2.0)
+        # Saturate the crash counter so the existing cond_crashed check fires.
+        self._crashed = torch.where(
+            cond_off_track,
+            torch.full_like(self._crashed, 101),
+            self._crashed,
+        )
+
         #TODO ----- END ----- [OPTIONAL]
 
         died = (
