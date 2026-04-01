@@ -12,7 +12,7 @@ from .rl_cfg import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgo
 class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # Longer rollouts give better GAE estimates; 64 steps ≈ ~1.3 s at 50 Hz policy rate
     num_steps_per_env = 64
-    max_iterations = 8000
+    max_iterations = 20000
     save_interval = 25
     experiment_name = "quadcopter_direct"
     empirical_normalization = False
