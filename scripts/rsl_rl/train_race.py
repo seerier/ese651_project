@@ -107,29 +107,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # TODO ----- START ----- Define rewards scales
     # Gate passage: large sparse reward — the primary training signal.
-    # Each gate passed gives a substantial bonus to drive gate-seeking behavior.
-    gate_pass_reward_scale = 10.0
+    gate_pass_reward_scale = 15.0
 
-    # Progress (potential-based shaping): reward per meter of distance reduction
-    # toward the current gate. Provides dense gradient signal between gate passages.
+    # Progress (potential-based shaping): dense gradient between gate passages.
     progress_goal_reward_scale = 2.0
 
-    # Velocity toward gate: reward for instantaneous speed in the gate direction.
-    # Directly incentivises fast racing rather than slow cautious approaches.
-    velocity_gate_reward_scale = 0.3
+    # Velocity toward gate: incentivises fast racing.
+    velocity_gate_reward_scale = 0.5
 
-    # Crash penalty: per-timestep contact-force penalty once contact is sustained.
+    # Crash penalty: per-timestep contact-force penalty.
     crash_reward = -0.5
 
-    # Death cost: large terminal penalty applied at episode end on a fatal termination.
-    death_cost = -10.0
+    # Death cost: terminal penalty on fatal termination.
+    death_cost = -15.0
+
+    # Wrong-side gate entry: heavy penalty to prevent DQ (gates 3/6 share physical gate).
+    wrong_side_reward_scale = -5.0
+
+    # Gate speed bonus: rewards velocity aligned with gate normal at passage.
+    gate_speed_bonus_reward_scale = 1.0
+
+    # Time penalty: small per-step cost to encourage speed over caution.
+    time_penalty_reward_scale = -0.05
+
+    # Angular velocity penalty: penalize excessive body rates for stability.
+    ang_vel_penalty_reward_scale = -0.01
 
     rewards = {
-        'gate_pass_reward_scale':     gate_pass_reward_scale,
-        'progress_goal_reward_scale': progress_goal_reward_scale,
-        'velocity_gate_reward_scale': velocity_gate_reward_scale,
-        'crash_reward_scale':         crash_reward,
-        'death_cost':                 death_cost,
+        'gate_pass_reward_scale':        gate_pass_reward_scale,
+        'progress_goal_reward_scale':    progress_goal_reward_scale,
+        'velocity_gate_reward_scale':    velocity_gate_reward_scale,
+        'crash_reward_scale':            crash_reward,
+        'death_cost':                    death_cost,
+        'wrong_side_reward_scale':       wrong_side_reward_scale,
+        'gate_speed_bonus_reward_scale': gate_speed_bonus_reward_scale,
+        'time_penalty_reward_scale':     time_penalty_reward_scale,
+        'ang_vel_penalty_reward_scale':  ang_vel_penalty_reward_scale,
     }
     # TODO ----- END -----
 

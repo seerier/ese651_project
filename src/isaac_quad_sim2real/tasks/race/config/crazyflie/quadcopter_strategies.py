@@ -77,15 +77,12 @@ class DefaultQuadcopterStrategy:
         gate_half = self.env.cfg.gate_model.gate_side / 2.0  # 0.5 m
 
         # --- Gate-crossing detection via sign change of gate-frame x-coordinate ---
-        # _pose_drone_wrt_gate is the drone position in the gate's local frame.
-        # The gate's x-axis is its normal (approach direction). The drone starts on the
-        # positive-x side and must fly through to the negative-x side to count as passed.
         curr_x = self.env._pose_drone_wrt_gate[:, 0]
         curr_y = self.env._pose_drone_wrt_gate[:, 1]
         curr_z = self.env._pose_drone_wrt_gate[:, 2]
         prev_x = self.env._prev_x_drone_wrt_gate
 
-        # Crossed from positive to non-positive while within the gate aperture (±y, ±z)
+        # Correct direction: crossed from positive to non-positive x within gate aperture
         gate_passed = (
             (prev_x > 0.0)
             & (curr_x <= 0.0)
@@ -94,18 +91,41 @@ class DefaultQuadcopterStrategy:
         )
         ids_gate_passed = torch.where(gate_passed)[0]
 
+        # --- Wrong-side gate entry: crossed from negative to positive x (DQ in eval!) ---
+        wrong_side_entry = (
+            (prev_x < 0.0)
+            & (curr_x >= 0.0)
+            & (torch.abs(curr_y) < gate_half + 0.2)
+            & (torch.abs(curr_z) < gate_half + 0.2)
+        )
+
+        # Compute world-frame velocity before gate advancement (needed for speed bonus)
+        rot_mat = matrix_from_quat(self.env._robot.data.root_quat_w)  # (N,3,3)
+        lin_vel_w = torch.bmm(
+            rot_mat, self.env._robot.data.root_com_lin_vel_b.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # --- Gate speed bonus: reward velocity aligned with gate normal at passage ---
+        gate_pass_speed_bonus = torch.zeros(self.num_envs, device=self.device)
+        if len(ids_gate_passed) > 0:
+            # Gate index they just passed (before incrementing)
+            passed_gate_idx = self.env._idx_wp[ids_gate_passed]
+            gate_normals = self.env._normal_vectors[passed_gate_idx]  # (K, 3)
+            vel_at_pass = lin_vel_w[ids_gate_passed]
+            # Speed through gate = dot(velocity, gate_normal), clamp positive
+            speed_through = (vel_at_pass * gate_normals).sum(dim=1).clamp(0.0, 10.0)
+            gate_pass_speed_bonus[ids_gate_passed] = speed_through
+
         # Advance waypoint index and update counters for envs that passed a gate
         if len(ids_gate_passed) > 0:
             self.env._n_gates_passed[ids_gate_passed] += 1
             self.env._idx_wp[ids_gate_passed] = (
                 self.env._idx_wp[ids_gate_passed] + 1
             ) % num_gates
-            # Update debug-vis target to next gate
             self.env._desired_pos_w[ids_gate_passed, :3] = (
                 self.env._waypoints[self.env._idx_wp[ids_gate_passed], :3]
             )
-            # Recompute gate-relative pose using the NEW target gate so that
-            # observations and the next progress step are consistent
+            # Recompute gate-relative pose using the NEW target gate
             new_pose, _ = subtract_frame_transforms(
                 self.env._waypoints[self.env._idx_wp[ids_gate_passed], :3],
                 self.env._waypoints_quat[self.env._idx_wp[ids_gate_passed], :],
@@ -117,25 +137,20 @@ class DefaultQuadcopterStrategy:
                 new_pose, dim=1
             )
 
-        # Update prev_x for envs that did NOT just pass a gate (used next timestep)
+        # Update prev_x for envs that did NOT just pass a gate
         self.env._prev_x_drone_wrt_gate[~gate_passed] = curr_x[~gate_passed]
 
-        # --- Dense potential-based progress reward: reward for closing distance to gate ---
+        # --- Dense potential-based progress reward ---
         dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
         progress = (self.env._last_distance_to_goal - dist_to_gate).clamp(-5.0, 5.0)
         self.env._last_distance_to_goal = dist_to_gate.clone()
 
-        # --- Velocity-toward-gate reward: encourages high racing speed ---
-        # Rotate body-frame velocity to world frame via the rotation matrix
-        rot_mat = matrix_from_quat(self.env._robot.data.root_quat_w)  # (N,3,3) body→world
-        lin_vel_w = torch.bmm(
-            rot_mat, self.env._robot.data.root_com_lin_vel_b.unsqueeze(-1)
-        ).squeeze(-1)
+        # --- Velocity-toward-gate reward ---
         gate_pos_w  = self.env._waypoints[self.env._idx_wp, :3]
         drone_pos_w = self.env._robot.data.root_link_pos_w
         vec_to_gate = gate_pos_w - drone_pos_w
         dist_for_vel = torch.norm(vec_to_gate, dim=1, keepdim=True).clamp(min=1e-6)
-        dir_to_gate = vec_to_gate / dist_for_vel               # unit vector toward gate
+        dir_to_gate = vec_to_gate / dist_for_vel
         vel_toward_gate = (lin_vel_w * dir_to_gate).sum(dim=1).clamp(-5.0, 10.0)
 
         # --- Crash detection: sustained contact force for > 100 timesteps ---
@@ -144,15 +159,27 @@ class DefaultQuadcopterStrategy:
         mask = (self.env.episode_length_buf > 100).int()
         self.env._crashed = self.env._crashed + crashed * mask
 
+        # --- Time penalty: constant per-step cost to encourage speed ---
+        time_penalty = torch.ones(self.num_envs, device=self.device)
+
+        # --- Angular velocity penalty: penalize excessive body rates for stability ---
+        ang_vel_penalty = torch.norm(
+            self.env._robot.data.root_ang_vel_b, dim=1
+        )
+
         # TODO ----- END -----
 
         if self.cfg.is_train:
             # TODO ----- START ----- Compute per-timestep rewards by multiplying with your reward scales (in train_race.py)
             rewards = {
-                "gate_pass":     gate_passed.float()  * self.env.rew['gate_pass_reward_scale'],
-                "progress_goal": progress             * self.env.rew['progress_goal_reward_scale'],
-                "velocity_gate": vel_toward_gate      * self.env.rew['velocity_gate_reward_scale'],
-                "crash":         crashed.float()      * self.env.rew['crash_reward_scale'],
+                "gate_pass":        gate_passed.float()         * self.env.rew['gate_pass_reward_scale'],
+                "progress_goal":    progress                    * self.env.rew['progress_goal_reward_scale'],
+                "velocity_gate":    vel_toward_gate             * self.env.rew['velocity_gate_reward_scale'],
+                "crash":            crashed.float()             * self.env.rew['crash_reward_scale'],
+                "wrong_side":       wrong_side_entry.float()    * self.env.rew['wrong_side_reward_scale'],
+                "gate_speed_bonus": gate_pass_speed_bonus       * self.env.rew['gate_speed_bonus_reward_scale'],
+                "time_penalty":     time_penalty                * self.env.rew['time_penalty_reward_scale'],
+                "ang_vel_penalty":  ang_vel_penalty              * self.env.rew['ang_vel_penalty_reward_scale'],
             }
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
             reward = torch.where(self.env.reset_terminated,
@@ -180,15 +207,13 @@ class DefaultQuadcopterStrategy:
         drone_ang_vel_b = self.env._robot.data.root_ang_vel_b       # (N, 3)
 
         # Gravity vector projected into body frame: encodes roll and pitch tilt compactly.
-        # R maps body→world, so g_body = R^T @ [0,0,-1] = -row-2 of R.
         rot_mat_obs = matrix_from_quat(self.env._robot.data.root_quat_w)  # (N, 3, 3)
         gravity_b = -rot_mat_obs[:, 2, :]                                  # (N, 3)
 
         # Current target gate: drone position in gate's local frame.
-        # Gives direction and distance to gate in a frame-aligned coordinate system.
         drone_pos_gate_frame = self.env._pose_drone_wrt_gate          # (N, 3)
 
-        # Next gate look-ahead: lets the policy plan smooth racing lines through gates
+        # Next gate look-ahead (gate+1): lets the policy plan smooth racing lines
         num_gates_obs = self.env._waypoints.shape[0]
         next_gate_idx = (self.env._idx_wp + 1) % num_gates_obs
         drone_pos_next_gate_frame, _ = subtract_frame_transforms(
@@ -196,6 +221,34 @@ class DefaultQuadcopterStrategy:
             self.env._waypoints_quat[next_gate_idx, :],
             self.env._robot.data.root_link_pos_w,
         )  # (N, 3)
+
+        # Second look-ahead (gate+2): critical for powerloop setup and chicane planning
+        next_next_gate_idx = (self.env._idx_wp + 2) % num_gates_obs
+        drone_pos_next_next_gate_frame, _ = subtract_frame_transforms(
+            self.env._waypoints[next_next_gate_idx, :3],
+            self.env._waypoints_quat[next_next_gate_idx, :],
+            self.env._robot.data.root_link_pos_w,
+        )  # (N, 3)
+
+        # Gate normal direction in body frame: tells agent which direction to fly through gate.
+        # Essential for disambiguating gates 3 vs 6 (same physical gate, opposite directions).
+        gate_normal_w = self.env._normal_vectors[self.env._idx_wp]  # (N, 3)
+        gate_normal_b = torch.bmm(
+            rot_mat_obs.transpose(1, 2), gate_normal_w.unsqueeze(-1)
+        ).squeeze(-1)  # (N, 3)
+
+        # Scalar distance to current gate: easier for value function estimation
+        dist_to_gate = torch.linalg.norm(
+            self.env._pose_drone_wrt_gate, dim=1, keepdim=True
+        )  # (N, 1)
+
+        # Height above ground: helps takeoff from ground starts and avoid floor crashes
+        height = self.env._robot.data.root_link_pos_w[:, 2:3]  # (N, 1)
+
+        # Lap progress: fraction through current lap for value estimation over 3-lap horizon
+        lap_progress = (
+            (self.env._n_gates_passed.float() % num_gates_obs) / num_gates_obs
+        ).unsqueeze(-1)  # (N, 1)
 
         # Previous policy outputs (CTBR): temporal context for smooth control
         prev_actions = self.env._previous_actions                     # (N, 4)
@@ -205,12 +258,17 @@ class DefaultQuadcopterStrategy:
         obs = torch.cat(
             # TODO ----- START ----- List your observation tensors here to be concatenated together
             [
-                drone_lin_vel_b,            # 3  body-frame linear velocity
-                drone_ang_vel_b,            # 3  body-frame angular velocity (body rates)
-                gravity_b,                  # 3  gravity in body frame (roll/pitch tilt proxy)
-                drone_pos_gate_frame,       # 3  drone position in current gate frame
-                drone_pos_next_gate_frame,  # 3  drone position in next gate frame (look-ahead)
-                prev_actions,               # 4  previous CTBR policy output
+                drone_lin_vel_b,                # 3  body-frame linear velocity
+                drone_ang_vel_b,                # 3  body-frame angular velocity
+                gravity_b,                      # 3  gravity in body frame
+                drone_pos_gate_frame,           # 3  drone pos in current gate frame
+                drone_pos_next_gate_frame,      # 3  drone pos in next gate frame
+                drone_pos_next_next_gate_frame, # 3  drone pos in gate+2 frame
+                gate_normal_b,                  # 3  gate normal in body frame
+                dist_to_gate,                   # 1  scalar distance to gate
+                height,                         # 1  altitude
+                lap_progress,                   # 1  fraction through current lap
+                prev_actions,                   # 4  previous CTBR output
             ],
             # TODO ----- END -----
             dim=-1,
@@ -329,8 +387,8 @@ class DefaultQuadcopterStrategy:
 
         # ----------------------------------------------------------------
         # Curriculum starting positions: randomly sample ANY gate on the track.
-        # This immediately exposes the policy to all gates and approach angles,
-        # dramatically accelerating learning compared to always starting at gate 0.
+        # Approach distance grows with training (curriculum).
+        # 20% of resets start from ground near gate 0 to match eval conditions.
         # ----------------------------------------------------------------
         num_gates_reset = self.env._waypoints.shape[0]
         waypoint_indices = torch.randint(
@@ -343,16 +401,15 @@ class DefaultQuadcopterStrategy:
         z_wp  = self.env._waypoints[waypoint_indices, 2]
         theta = self.env._waypoints[waypoint_indices, -1]
 
-        # Randomized approach offset in gate local frame:
-        #   x_local > 0  → drone in front of gate (positive gate-frame x)
-        #   y_local      → lateral spread within the gate corridor
-        #   z_local      → height variation around gate centre
-        approach_d = torch.empty(n_reset, device=self.device).uniform_(1.2, 3.5)
+        # Curriculum: approach distance grows with training progress
+        progress_frac = min(1.0, self.env.iteration / 2000.0)
+        min_approach = 0.5 + 0.7 * progress_frac   # 0.5 → 1.2
+        max_approach = 1.5 + 2.0 * progress_frac   # 1.5 → 3.5
+        approach_d = torch.empty(n_reset, device=self.device).uniform_(min_approach, max_approach)
         lat_offset = torch.empty(n_reset, device=self.device).uniform_(-0.35, 0.35)
         z_offset   = torch.empty(n_reset, device=self.device).uniform_(-0.25, 0.25)
 
         # Rotate from gate local frame to world frame
-        # Gate x-axis in world = [cos(theta), sin(theta), 0]
         cos_theta = torch.cos(theta)
         sin_theta = torch.sin(theta)
         dx_w = cos_theta * approach_d - sin_theta * lat_offset
@@ -365,9 +422,11 @@ class DefaultQuadcopterStrategy:
         default_root_state[:, 0] = initial_x
         default_root_state[:, 1] = initial_y
         default_root_state[:, 2] = initial_z
-        default_root_state[:, 7:] = 0.0  # zero initial velocity for clean episode start
+        # Small initial velocity noise for robustness
+        default_root_state[:, 7:10] = torch.empty(n_reset, 3, device=self.device).uniform_(-0.3, 0.3)
+        default_root_state[:, 10:] = 0.0  # zero angular velocity
 
-        # Point drone toward chosen gate + small yaw noise for orientation robustness
+        # Point drone toward chosen gate + small yaw noise
         initial_yaw = torch.atan2(y0_wp - initial_y, x0_wp - initial_x)
         quat = quat_from_euler_xyz(
             torch.zeros(n_reset, device=self.device),
@@ -375,6 +434,41 @@ class DefaultQuadcopterStrategy:
             initial_yaw + torch.empty(n_reset, device=self.device).uniform_(-0.20, 0.20),
         )
         default_root_state[:, 3:7] = quat
+
+        # ----------------------------------------------------------------
+        # Ground starts: 20% of resets start from ground near gate 0.
+        # This mimics the TA evaluation condition (drone starts at z≈0.05
+        # with x_local ∈ [-3, -0.5], y_local ∈ [-1, 1] relative to gate 0).
+        # ----------------------------------------------------------------
+        if self.cfg.is_train:
+            ground_start_mask = torch.rand(n_reset, device=self.device) < 0.2
+            gs_ids = ground_start_mask.nonzero(as_tuple=True)[0]
+            n_gs = len(gs_ids)
+            if n_gs > 0:
+                waypoint_indices[gs_ids] = 0
+                x_local_gs = torch.empty(n_gs, device=self.device).uniform_(-3.0, -0.5)
+                y_local_gs = torch.empty(n_gs, device=self.device).uniform_(-1.0, 1.0)
+                x0_wp_gs = self.env._waypoints[0, 0]
+                y0_wp_gs = self.env._waypoints[0, 1]
+                theta_gs = self.env._waypoints[0, -1]
+                cos_t, sin_t = torch.cos(theta_gs), torch.sin(theta_gs)
+                x_rot = cos_t * x_local_gs - sin_t * y_local_gs
+                y_rot = sin_t * x_local_gs + cos_t * y_local_gs
+                default_root_state[gs_ids, 0] = x0_wp_gs - x_rot
+                default_root_state[gs_ids, 1] = y0_wp_gs - y_rot
+                default_root_state[gs_ids, 2] = 0.05
+                default_root_state[gs_ids, 7:] = 0.0  # zero velocity for ground start
+                # Point toward gate 0
+                yaw_gs = torch.atan2(
+                    y0_wp_gs - default_root_state[gs_ids, 1],
+                    x0_wp_gs - default_root_state[gs_ids, 0],
+                )
+                quat_gs = quat_from_euler_xyz(
+                    torch.zeros(n_gs, device=self.device),
+                    torch.zeros(n_gs, device=self.device),
+                    yaw_gs,
+                )
+                default_root_state[gs_ids, 3:7] = quat_gs
 
         # TODO ----- END -----
 
