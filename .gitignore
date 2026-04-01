@@ -22,3 +22,6 @@
 # Slurm
 *.out
 *.err
+
+# Claude
+CLAUDE.md
