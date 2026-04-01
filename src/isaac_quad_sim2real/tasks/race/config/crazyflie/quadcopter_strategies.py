@@ -167,6 +167,9 @@ class DefaultQuadcopterStrategy:
             self.env._robot.data.root_ang_vel_b, dim=1
         )
 
+        # --- Wrong-side entry terminates episode (matches eval DQ rule) ---
+        self.env.reset_terminated = self.env.reset_terminated | wrong_side_entry
+
         # TODO ----- END -----
 
         if self.cfg.is_train:

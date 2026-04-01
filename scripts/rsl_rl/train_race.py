@@ -121,8 +121,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Death cost: terminal penalty on fatal termination.
     death_cost = -15.0
 
-    # Wrong-side gate entry: heavy penalty to prevent DQ (gates 3/6 share physical gate).
-    wrong_side_reward_scale = -5.0
+    # Wrong-side gate entry: heavy penalty + episode termination to prevent DQ.
+    wrong_side_reward_scale = -15.0
 
     # Gate speed bonus: rewards velocity aligned with gate normal at passage.
     gate_speed_bonus_reward_scale = 1.0
