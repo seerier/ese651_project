@@ -241,6 +241,10 @@ class DefaultQuadcopterStrategy:
                 drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
             )
         progress = (self.env._last_distance_to_goal - dist_to_gate).clamp(-5.0, 5.0)
+        # Boost progress during powerloop: 3x stronger pull toward virtual WP
+        # to overcome horizontal momentum after passing gate 2
+        if in_powerloop.any():
+            progress[in_powerloop] *= 3.0
         self.env._last_distance_to_goal = dist_to_gate.clone()
 
         # --- Velocity-toward-gate reward ---
