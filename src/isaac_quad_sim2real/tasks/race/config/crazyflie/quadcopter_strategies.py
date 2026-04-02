@@ -34,6 +34,10 @@ class DefaultQuadcopterStrategy:
         self.num_envs = env.num_envs
         self.cfg = env.cfg
 
+        # Track gate-frame x-coordinate for ALL gates (for all-gate wrong-side detection)
+        num_gates = env._waypoints.shape[0]
+        self._prev_x_all_gates = torch.ones(self.num_envs, num_gates, device=self.device)
+
         # Initialize episode sums for logging if in training mode
         if self.cfg.is_train and hasattr(env, 'rew'):
             keys = [key.split("_reward_scale")[0] for key in env.rew.keys() if key != "death_cost"]
@@ -98,6 +102,38 @@ class DefaultQuadcopterStrategy:
             & (torch.abs(curr_y) < gate_half + 0.2)
             & (torch.abs(curr_z) < gate_half + 0.2)
         )
+
+        # --- All-gate wrong-side detection: catch reverse passes through ANY gate ---
+        # Fixes exploit: after passing gate 2, drone reverses through gate 2 undetected
+        # because curr_x/prev_x only track the current target gate.
+        wrong_side_any_gate = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for i in range(num_gates):
+            gate_pos_i = self.env._waypoints[i, :3].unsqueeze(0).expand(self.num_envs, -1)
+            gate_quat_i = self.env._waypoints_quat[i, :].unsqueeze(0).expand(self.num_envs, -1)
+            pos_in_gate_i, _ = subtract_frame_transforms(
+                gate_pos_i, gate_quat_i,
+                self.env._robot.data.root_link_pos_w[:, :3],
+            )
+            curr_x_i = pos_in_gate_i[:, 0]
+            curr_y_i = pos_in_gate_i[:, 1]
+            curr_z_i = pos_in_gate_i[:, 2]
+
+            # Skip current target gate (already handled above)
+            is_current = (self.env._idx_wp == i)
+
+            wrong_side_i = (
+                (self._prev_x_all_gates[:, i] < 0.0)
+                & (curr_x_i >= 0.0)
+                & (torch.abs(curr_y_i) < gate_half + 0.2)
+                & (torch.abs(curr_z_i) < gate_half + 0.2)
+                & (~is_current)
+            )
+            wrong_side_any_gate = wrong_side_any_gate | wrong_side_i
+
+            self._prev_x_all_gates[:, i] = curr_x_i
+
+        # Merge: wrong-side through ANY gate triggers termination
+        wrong_side_entry = wrong_side_entry | wrong_side_any_gate
 
         # Compute world-frame velocity before gate advancement (needed for speed bonus)
         rot_mat = matrix_from_quat(self.env._robot.data.root_quat_w)  # (N,3,3)
@@ -572,5 +608,6 @@ class DefaultQuadcopterStrategy:
         )
 
         self.env._prev_x_drone_wrt_gate[env_ids] = 1.0
+        self._prev_x_all_gates[env_ids] = 1.0
 
         self.env._crashed[env_ids] = 0
