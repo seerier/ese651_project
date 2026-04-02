@@ -168,8 +168,8 @@ class DefaultQuadcopterStrategy:
         )
 
         # --- Wrong-side entry terminates episode (matches eval DQ rule) ---
-        # Curriculum: only terminate after iteration 1000 so early training can learn multi-gate flight
-        if self.env.iteration >= 1000:
+        # Curriculum: only delay termination during early training; always terminate during eval
+        if not self.cfg.is_train or self.env.iteration >= 1000:
             self.env.reset_terminated = self.env.reset_terminated | wrong_side_entry
 
         # --- Wrong-side proximity: dense penalty for being on exit side of current gate ---
