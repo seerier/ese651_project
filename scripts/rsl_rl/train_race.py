@@ -136,6 +136,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Wrong-side proximity: dense penalty for approaching gate from exit side.
     wrong_side_prox_reward_scale = -2.0
 
+    # Exit repulsion: repulsive penalty near exit side of ALL gates (not just current target).
+    # Prevents brush-and-turn exploit at gates 2→3 and elsewhere.
+    exit_repulsion_reward_scale = -3.0
+
     rewards = {
         'gate_pass_reward_scale':        gate_pass_reward_scale,
         'progress_goal_reward_scale':    progress_goal_reward_scale,
@@ -147,6 +151,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'time_penalty_reward_scale':     time_penalty_reward_scale,
         'ang_vel_penalty_reward_scale':  ang_vel_penalty_reward_scale,
         'wrong_side_prox_reward_scale':  wrong_side_prox_reward_scale,
+        'exit_repulsion_reward_scale':   exit_repulsion_reward_scale,
     }
     # TODO ----- END -----
 
