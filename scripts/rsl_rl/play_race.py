@@ -88,8 +88,9 @@ def main():
         env_cfg.viewer.resolution = (1920, 1080)
         # env_cfg.viewer.eye = (10.7, 0.4, 7.2)
         # env_cfg.viewer.lookat = (-2.7, 0.5, -0.3)
-        env_cfg.viewer.eye = (5.0, -3.0, 3.0)
-        env_cfg.viewer.lookat = (0.625, 0.0, 0.75)
+        # Bird's-eye overview: high above track center, slight angle for depth
+        env_cfg.viewer.eye = (0.25, -5.0, 12.0)
+        env_cfg.viewer.lookat = (0.25, 0.0, 0.75)
     elif args_cli.follow_robot >= 0:
         env_cfg.viewer.eye = (-0.8, 0.8, 0.8)
         env_cfg.viewer.resolution = (1920, 1080)
