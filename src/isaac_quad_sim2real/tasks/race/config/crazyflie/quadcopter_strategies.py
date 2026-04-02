@@ -111,14 +111,14 @@ class DefaultQuadcopterStrategy:
         ids_gate_passed = torch.where(gate_passed)[0]
 
         # --- Wrong-side gate entry: crossed from negative to positive x (DQ in eval!) ---
-        # Use distance-based check (2.0m radius) instead of tight aperture (0.7m).
-        # Gates 2&3 are 1.25m apart with same yaw; tight aperture misses wrong-side
-        # crossings that occur offset from the gate center.
+        # Distance-based check: 1.2m catches any real wrong-side pass (max aperture
+        # corner distance ~0.85m) while allowing the powerloop Y=0 crossing at Z≈2.0
+        # (min distance to gate 3 at Z=2.0 is 1.25m > 1.2m).
         dist_to_target_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
         wrong_side_entry = (
             (prev_x < 0.0)
             & (curr_x >= 0.0)
-            & (dist_to_target_gate < 2.0)
+            & (dist_to_target_gate < 1.2)
         )
 
         # --- All-gate wrong-side detection: catch reverse passes through ANY gate ---
@@ -149,7 +149,7 @@ class DefaultQuadcopterStrategy:
             wrong_side_i = (
                 (self._prev_x_all_gates[:, i] < 0.0)
                 & (curr_x_i >= 0.0)
-                & (dist_to_gate_i < 2.0)
+                & (dist_to_gate_i < 1.2)
                 & (~is_current)
                 & (~is_colocated_with_target)
             )
@@ -208,7 +208,8 @@ class DefaultQuadcopterStrategy:
                 gate3_pos = self.env._waypoints[3, :3]
                 powerloop_wp = (gate2_pos + gate3_pos) / 2.0
                 powerloop_wp = powerloop_wp.clone()
-                powerloop_wp[2] += 2.0  # 2m above midpoint
+                powerloop_wp[1] -= 0.5  # Align with post-gate-2 -Y momentum
+                powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.2m wrong-side zone)
                 drone_pos_pl = self.env._robot.data.root_link_pos_w[entering_powerloop, :3]
                 self.env._last_distance_to_goal[entering_powerloop] = torch.linalg.norm(
                     drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
@@ -226,7 +227,8 @@ class DefaultQuadcopterStrategy:
         gate3_pos = self.env._waypoints[3, :3]
         powerloop_wp = (gate2_pos + gate3_pos) / 2.0
         powerloop_wp = powerloop_wp.clone()
-        powerloop_wp[2] += 2.0  # 2m above midpoint
+        powerloop_wp[1] -= 0.5  # Align with post-gate-2 -Y momentum
+        powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.2m wrong-side zone)
 
         is_target_gate3 = (self.env._idx_wp == 3)
         gate3_frame_x = self.env._pose_drone_wrt_gate[:, 0]
@@ -257,6 +259,9 @@ class DefaultQuadcopterStrategy:
         dist_for_vel = torch.norm(vec_to_gate, dim=1, keepdim=True).clamp(min=1e-6)
         dir_to_gate = vec_to_gate / dist_for_vel
         vel_toward_gate = (lin_vel_w * dir_to_gate).sum(dim=1).clamp(-5.0, 10.0)
+        # Boost velocity reward during powerloop: 2x to encourage fast execution
+        if in_powerloop.any():
+            vel_toward_gate[in_powerloop] *= 2.0
 
         # --- Crash detection: sustained contact force for > 100 timesteps ---
         contact_forces = self.env._contact_sensor.data.net_forces_w
