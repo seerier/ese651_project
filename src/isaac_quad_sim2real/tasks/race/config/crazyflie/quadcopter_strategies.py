@@ -180,7 +180,10 @@ class DefaultQuadcopterStrategy:
             gate_normals = self.env._normal_vectors[passed_gate_idx]  # (K, 3)
             vel_at_pass = lin_vel_w[ids_gate_passed]
             # Speed through gate = dot(velocity, gate_normal), clamp positive
-            speed_through = (-vel_at_pass * gate_normals).sum(dim=1).clamp(0.0, 10.0)
+            # Quadratic bonus: disproportionately rewards faster crossings
+            # 2m/s→0.4, 5m/s→2.5, 10m/s→10 (same max as before)
+            speed_through_raw = (-vel_at_pass * gate_normals).sum(dim=1).clamp(0.0, 10.0)
+            speed_through = speed_through_raw ** 2 / 10.0
             gate_pass_speed_bonus[ids_gate_passed] = speed_through
 
         # Advance waypoint index and update counters for envs that passed a gate
@@ -350,19 +353,29 @@ class DefaultQuadcopterStrategy:
 
         if self.cfg.is_train:
             # TODO ----- START ----- Compute per-timestep rewards by multiplying with your reward scales (in train_race.py)
+            # Speed curriculum: ramp velocity/time rewards as policy matures
+            speed_frac = min(1.0, self.env.iteration / 3000.0)
+            vel_curriculum_scale = 0.5 + 1.0 * speed_frac    # 0.5 → 1.5
+            time_curriculum_scale = 0.5 + 1.0 * speed_frac   # 0.5 → 1.5
+
             rewards = {
                 "gate_pass":        gate_passed.float()         * self.env.rew['gate_pass_reward_scale'],
                 "progress_goal":    progress                    * self.env.rew['progress_goal_reward_scale'],
-                "velocity_gate":    vel_toward_gate             * self.env.rew['velocity_gate_reward_scale'],
+                "velocity_gate":    vel_toward_gate             * self.env.rew['velocity_gate_reward_scale'] * vel_curriculum_scale,
                 "crash":            crashed.float()             * self.env.rew['crash_reward_scale'],
                 "wrong_side":       wrong_side_entry.float()    * self.env.rew['wrong_side_reward_scale'],
                 "gate_speed_bonus": gate_pass_speed_bonus       * self.env.rew['gate_speed_bonus_reward_scale'],
-                "time_penalty":     time_penalty                * self.env.rew['time_penalty_reward_scale'],
+                "time_penalty":     time_penalty                * self.env.rew['time_penalty_reward_scale'] * time_curriculum_scale,
                 "ang_vel_penalty":  ang_vel_penalty              * self.env.rew['ang_vel_penalty_reward_scale'],
                 "wrong_side_prox":  wrong_side_proximity         * self.env.rew['wrong_side_prox_reward_scale'],
                 "exit_repulsion":   exit_repulsion               * self.env.rew['exit_repulsion_reward_scale'],
             }
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+
+            # Action smoothness: penalize jerky control for sim-to-real robustness
+            action_smoothness = -0.03 * torch.norm(self.env._actions - self.env._previous_actions, dim=1)
+            reward = reward + action_smoothness
+
             # Fix 1: wrong-side deaths get death_cost + wrong_side penalty (-5 + -15 = -20)
             # Other deaths get just death_cost (-5). Previously, wrong_side -15 was
             # computed but overwritten by death_cost, making wrong-side = normal death.
@@ -448,6 +461,19 @@ class DefaultQuadcopterStrategy:
         # Previous policy outputs (CTBR): temporal context for smooth control
         prev_actions = self.env._previous_actions                     # (N, 4)
 
+        # Velocity toward current gate (scalar): helps policy optimize approach speed
+        vel_toward_gate_obs = torch.sum(
+            drone_lin_vel_b * gate_normal_b, dim=1, keepdim=True
+        )  # (N, 1)
+
+        # Arc phase indicator: normalized to [0, 1], disambiguates horizontal arc position
+        arc_phase_obs = (self._arc_phase.float() / 3.0).unsqueeze(-1)  # (N, 1)
+
+        # Normalized episode time: helps value function estimate remaining time budget
+        episode_time_frac = (
+            self.env.episode_length_buf.float() / self.env.max_episode_length
+        ).unsqueeze(-1)  # (N, 1)
+
         # TODO ----- END -----
 
         obs = torch.cat(
@@ -464,6 +490,9 @@ class DefaultQuadcopterStrategy:
                 height,                         # 1  altitude
                 lap_progress,                   # 1  fraction through current lap
                 prev_actions,                   # 4  previous CTBR output
+                vel_toward_gate_obs,            # 1  velocity toward gate (scalar)
+                arc_phase_obs,                  # 1  arc phase indicator [0, 1]
+                episode_time_frac,              # 1  normalized episode time
             ],
             # TODO ----- END -----
             dim=-1,
@@ -534,30 +563,38 @@ class DefaultQuadcopterStrategy:
         # learns to be robust to the perturbation ranges used in evaluation.
         # ----------------------------------------------------------------
         if self.cfg.is_train:
-            # Thrust-to-weight ratio: ±5%
+            # DR curriculum: start narrow, widen to full range over training
+            dr_frac = min(1.0, 0.2 + 0.8 * (self.env.iteration / 2000.0))
+
+            # Thrust-to-weight ratio: ±5% scaled by dr_frac
+            twr_delta = 0.05 * dr_frac
             self.env._thrust_to_weight[env_ids] = torch.empty(
                 n_reset, device=self.device
-            ).uniform_(self.env._twr_value * 0.95, self.env._twr_value * 1.05)
+            ).uniform_(self.env._twr_value * (1.0 - twr_delta), self.env._twr_value * (1.0 + twr_delta))
 
-            # Aerodynamic drag coefficients: 0.5× – 2.0×
+            # Aerodynamic drag coefficients: range scaled by dr_frac
+            drag_lo = 1.0 - 0.5 * dr_frac   # 1.0 → 0.5
+            drag_hi = 1.0 + 1.0 * dr_frac   # 1.0 → 2.0
             k_xy = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._k_aero_xy_value * 0.5, self.env._k_aero_xy_value * 2.0
+                self.env._k_aero_xy_value * drag_lo, self.env._k_aero_xy_value * drag_hi
             )
             self.env._K_aero[env_ids, 0] = k_xy
             self.env._K_aero[env_ids, 1] = k_xy
             self.env._K_aero[env_ids, 2] = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._k_aero_z_value * 0.5, self.env._k_aero_z_value * 2.0
+                self.env._k_aero_z_value * drag_lo, self.env._k_aero_z_value * drag_hi
             )
 
-            # PID gains – roll/pitch: kp/ki ±15%, kd ±30%
+            # PID gains – roll/pitch: kp/ki ±15%, kd ±30%, scaled by dr_frac
+            kpki_rp_delta = 0.15 * dr_frac
+            kd_rp_delta = 0.30 * dr_frac
             kp_rp = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._kp_omega_rp_value * 0.85, self.env._kp_omega_rp_value * 1.15
+                self.env._kp_omega_rp_value * (1.0 - kpki_rp_delta), self.env._kp_omega_rp_value * (1.0 + kpki_rp_delta)
             )
             ki_rp = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._ki_omega_rp_value * 0.85, self.env._ki_omega_rp_value * 1.15
+                self.env._ki_omega_rp_value * (1.0 - kpki_rp_delta), self.env._ki_omega_rp_value * (1.0 + kpki_rp_delta)
             )
             kd_rp = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._kd_omega_rp_value * 0.70, self.env._kd_omega_rp_value * 1.30
+                self.env._kd_omega_rp_value * (1.0 - kd_rp_delta), self.env._kd_omega_rp_value * (1.0 + kd_rp_delta)
             )
             self.env._kp_omega[env_ids, 0] = kp_rp
             self.env._kp_omega[env_ids, 1] = kp_rp
@@ -566,15 +603,17 @@ class DefaultQuadcopterStrategy:
             self.env._kd_omega[env_ids, 0] = kd_rp
             self.env._kd_omega[env_ids, 1] = kd_rp
 
-            # PID gains – yaw: kp/ki ±15%, kd ±30%
+            # PID gains – yaw: kp/ki ±15%, kd ±30%, scaled by dr_frac
+            kpki_y_delta = 0.15 * dr_frac
+            kd_y_delta = 0.30 * dr_frac
             kp_y = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._kp_omega_y_value * 0.85, self.env._kp_omega_y_value * 1.15
+                self.env._kp_omega_y_value * (1.0 - kpki_y_delta), self.env._kp_omega_y_value * (1.0 + kpki_y_delta)
             )
             ki_y = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._ki_omega_y_value * 0.85, self.env._ki_omega_y_value * 1.15
+                self.env._ki_omega_y_value * (1.0 - kpki_y_delta), self.env._ki_omega_y_value * (1.0 + kpki_y_delta)
             )
             kd_y = torch.empty(n_reset, device=self.device).uniform_(
-                self.env._kd_omega_y_value * 0.70, self.env._kd_omega_y_value * 1.30
+                self.env._kd_omega_y_value * (1.0 - kd_y_delta), self.env._kd_omega_y_value * (1.0 + kd_y_delta)
             )
             self.env._kp_omega[env_ids, 2] = kp_y
             self.env._ki_omega[env_ids, 2] = ki_y
