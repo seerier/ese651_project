@@ -38,6 +38,18 @@ class DefaultQuadcopterStrategy:
         num_gates = env._waypoints.shape[0]
         self._prev_x_all_gates = torch.ones(self.num_envs, num_gates, device=self.device)
 
+        # Precompute colocated gate pairs (gates at same position, e.g., gates 3 and 6)
+        # Used to skip false wrong-side triggers when passing one of a colocated pair
+        self._colocated_gates = {}
+        wp_pos = env._waypoints[:, :3]
+        for i in range(num_gates):
+            colocated = []
+            for j in range(num_gates):
+                if i != j and torch.linalg.norm(wp_pos[i] - wp_pos[j]) < 0.1:
+                    colocated.append(j)
+            if colocated:
+                self._colocated_gates[i] = colocated
+
         # Initialize episode sums for logging if in training mode
         if self.cfg.is_train and hasattr(env, 'rew'):
             keys = [key.split("_reward_scale")[0] for key in env.rew.keys() if key != "death_cost"]
@@ -96,11 +108,14 @@ class DefaultQuadcopterStrategy:
         ids_gate_passed = torch.where(gate_passed)[0]
 
         # --- Wrong-side gate entry: crossed from negative to positive x (DQ in eval!) ---
+        # Use distance-based check (2.0m radius) instead of tight aperture (0.7m).
+        # Gates 2&3 are 1.25m apart with same yaw; tight aperture misses wrong-side
+        # crossings that occur offset from the gate center.
+        dist_to_target_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
         wrong_side_entry = (
             (prev_x < 0.0)
             & (curr_x >= 0.0)
-            & (torch.abs(curr_y) < gate_half + 0.2)
-            & (torch.abs(curr_z) < gate_half + 0.2)
+            & (dist_to_target_gate < 2.0)
         )
 
         # --- All-gate wrong-side detection: catch reverse passes through ANY gate ---
@@ -115,18 +130,25 @@ class DefaultQuadcopterStrategy:
                 self.env._robot.data.root_link_pos_w[:, :3],
             )
             curr_x_i = pos_in_gate_i[:, 0]
-            curr_y_i = pos_in_gate_i[:, 1]
-            curr_z_i = pos_in_gate_i[:, 2]
 
             # Skip current target gate (already handled above)
             is_current = (self.env._idx_wp == i)
 
+            # Skip gates colocated with current target (e.g., skip gate 6 when targeting gate 3)
+            # Gates 3&6 share position but opposite yaw; correct pass through one looks like
+            # wrong-side entry through the other without this skip.
+            is_colocated_with_target = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            if i in self._colocated_gates:
+                for j in self._colocated_gates[i]:
+                    is_colocated_with_target = is_colocated_with_target | (self.env._idx_wp == j)
+
+            dist_to_gate_i = torch.linalg.norm(pos_in_gate_i, dim=1)
             wrong_side_i = (
                 (self._prev_x_all_gates[:, i] < 0.0)
                 & (curr_x_i >= 0.0)
-                & (torch.abs(curr_y_i) < gate_half + 0.2)
-                & (torch.abs(curr_z_i) < gate_half + 0.2)
+                & (dist_to_gate_i < 2.0)
                 & (~is_current)
+                & (~is_colocated_with_target)
             )
             wrong_side_any_gate = wrong_side_any_gate | wrong_side_i
 
@@ -173,16 +195,56 @@ class DefaultQuadcopterStrategy:
                 new_pose, dim=1
             )
 
+            # Powerloop: for envs that just advanced to gate 3, override
+            # _last_distance_to_goal to use the virtual waypoint so the
+            # progress reward guides the drone UP, not directly at gate 3.
+            new_targets = self.env._idx_wp[ids_gate_passed]
+            entering_powerloop = ids_gate_passed[new_targets == 3]
+            if len(entering_powerloop) > 0:
+                gate2_pos = self.env._waypoints[2, :3]
+                gate3_pos = self.env._waypoints[3, :3]
+                powerloop_wp = (gate2_pos + gate3_pos) / 2.0
+                powerloop_wp = powerloop_wp.clone()
+                powerloop_wp[2] += 2.0  # 2m above midpoint
+                drone_pos_pl = self.env._robot.data.root_link_pos_w[entering_powerloop, :3]
+                self.env._last_distance_to_goal[entering_powerloop] = torch.linalg.norm(
+                    drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
+                )
+
         # Update prev_x for envs that did NOT just pass a gate
         self.env._prev_x_drone_wrt_gate[~gate_passed] = curr_x[~gate_passed]
 
+        # --- Virtual powerloop waypoint ---
+        # After passing gate 2, the direct path to gate 3 goes through its wrong side.
+        # When the drone targets gate 3 and is on the exit/wrong side (gate-frame x < 0),
+        # redirect progress and velocity rewards toward a waypoint 2m above the midpoint.
+        # This guides the drone UP (powerloop arc) instead of into gate 3's wrong side.
+        gate2_pos = self.env._waypoints[2, :3]
+        gate3_pos = self.env._waypoints[3, :3]
+        powerloop_wp = (gate2_pos + gate3_pos) / 2.0
+        powerloop_wp = powerloop_wp.clone()
+        powerloop_wp[2] += 2.0  # 2m above midpoint
+
+        is_target_gate3 = (self.env._idx_wp == 3)
+        gate3_frame_x = self.env._pose_drone_wrt_gate[:, 0]
+        in_powerloop = is_target_gate3 & (gate3_frame_x < 0.0)
+
         # --- Dense potential-based progress reward ---
         dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
+        # Override distance for powerloop envs: measure to virtual waypoint
+        if in_powerloop.any():
+            drone_pos_pl = self.env._robot.data.root_link_pos_w[in_powerloop, :3]
+            dist_to_gate[in_powerloop] = torch.linalg.norm(
+                drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
+            )
         progress = (self.env._last_distance_to_goal - dist_to_gate).clamp(-5.0, 5.0)
         self.env._last_distance_to_goal = dist_to_gate.clone()
 
         # --- Velocity-toward-gate reward ---
-        gate_pos_w  = self.env._waypoints[self.env._idx_wp, :3]
+        gate_pos_w  = self.env._waypoints[self.env._idx_wp, :3].clone()
+        # Override target for powerloop envs: velocity toward virtual waypoint
+        if in_powerloop.any():
+            gate_pos_w[in_powerloop] = powerloop_wp.unsqueeze(0)
         drone_pos_w = self.env._robot.data.root_link_pos_w
         vec_to_gate = gate_pos_w - drone_pos_w
         dist_for_vel = torch.norm(vec_to_gate, dim=1, keepdim=True).clamp(min=1e-6)
