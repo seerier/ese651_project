@@ -57,6 +57,9 @@ class DefaultQuadcopterStrategy:
                 key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
                 for key in keys
             }
+            # Extra monitoring metrics (not rewards, just diagnostics)
+            self._episode_sums["powerloop_active"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self._episode_sums["powerloop_progress"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # Initialize fixed parameters once (no domain randomization)
         # These parameters remain constant throughout the simulation
@@ -327,6 +330,12 @@ class DefaultQuadcopterStrategy:
             # Logging
             for key, value in rewards.items():
                 self._episode_sums[key] += value
+            # Powerloop diagnostics: track how often the drone is in powerloop mode
+            # and the progress it makes toward the virtual waypoint while in it
+            self._episode_sums["powerloop_active"] += in_powerloop.float()
+            powerloop_progress_step = torch.zeros(self.num_envs, device=self.device)
+            powerloop_progress_step[in_powerloop] = progress[in_powerloop]
+            self._episode_sums["powerloop_progress"] += powerloop_progress_step
         else:   # This else condition implies eval is called with play_race.py. Can be useful to debug at test-time
             reward = torch.zeros(self.num_envs, device=self.device)
             # TODO ----- END -----
