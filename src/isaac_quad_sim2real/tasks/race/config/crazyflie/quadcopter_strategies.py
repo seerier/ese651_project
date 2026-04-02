@@ -172,32 +172,41 @@ class DefaultQuadcopterStrategy:
         if not self.cfg.is_train or self.env.iteration >= 1000:
             self.env.reset_terminated = self.env.reset_terminated | wrong_side_entry
 
+        # --- Dense directional penalties: 3-stage curriculum ---
+        # Stage 1 (iter 0-500):   No dense penalties — drone learns to pass gates freely
+        # Stage 2 (iter 500-1000): Enable dense penalties — drone learns correct direction
+        # Stage 3 (iter 1000+):    + wrong-side termination (handled above)
+        # During eval (is_train=False): always enable all penalties
+        dense_penalty_active = (not self.cfg.is_train) or (self.env.iteration >= 500)
+
         # --- Wrong-side proximity: dense penalty for being on exit side of current gate ---
-        # curr_x < 0 means drone is on the exit side of the current target gate.
-        # Penalty scales with proximity: strongest near the gate, zero beyond 3m.
-        on_wrong_side = (curr_x < 0.0).float()
-        on_wrong_side[ids_gate_passed] = 0.0  # don't penalize correct gate passages
-        proximity_scale = torch.clamp(1.0 - dist_to_gate / 3.0, 0.0, 1.0)
-        wrong_side_proximity = on_wrong_side * proximity_scale
+        if dense_penalty_active:
+            on_wrong_side = (curr_x < 0.0).float()
+            on_wrong_side[ids_gate_passed] = 0.0  # don't penalize correct gate passages
+            proximity_scale = torch.clamp(1.0 - dist_to_gate / 3.0, 0.0, 1.0)
+            wrong_side_proximity = on_wrong_side * proximity_scale
+        else:
+            wrong_side_proximity = torch.zeros(self.num_envs, device=self.device)
 
         # --- Exit-side repulsion for ALL gates ---
-        # Prevents brush-and-turn exploit: penalizes lingering on exit side
-        # of any gate, not just the current target.
-        exit_repulsion = torch.zeros(self.num_envs, device=self.device)
-        for i in range(num_gates):
-            gate_pos_i = self.env._waypoints[i, :3].unsqueeze(0).expand(self.num_envs, -1)
-            gate_quat_i = self.env._waypoints_quat[i, :].unsqueeze(0).expand(self.num_envs, -1)
-            pos_in_gate_i, _ = subtract_frame_transforms(
-                gate_pos_i, gate_quat_i,
-                self.env._robot.data.root_link_pos_w[:, :3],
-            )
-            x_i = pos_in_gate_i[:, 0]
-            dist_i = torch.linalg.norm(pos_in_gate_i, dim=1)
-            # Skip current target gate (already covered by wrong_side_prox)
-            is_current = (self.env._idx_wp == i)
-            on_exit = (x_i < 0.0).float() * (~is_current).float()
-            prox = torch.clamp(1.0 - dist_i / 1.5, 0.0, 1.0)
-            exit_repulsion += on_exit * prox
+        if dense_penalty_active:
+            exit_repulsion = torch.zeros(self.num_envs, device=self.device)
+            for i in range(num_gates):
+                gate_pos_i = self.env._waypoints[i, :3].unsqueeze(0).expand(self.num_envs, -1)
+                gate_quat_i = self.env._waypoints_quat[i, :].unsqueeze(0).expand(self.num_envs, -1)
+                pos_in_gate_i, _ = subtract_frame_transforms(
+                    gate_pos_i, gate_quat_i,
+                    self.env._robot.data.root_link_pos_w[:, :3],
+                )
+                x_i = pos_in_gate_i[:, 0]
+                dist_i = torch.linalg.norm(pos_in_gate_i, dim=1)
+                # Skip current target gate (already covered by wrong_side_prox)
+                is_current = (self.env._idx_wp == i)
+                on_exit = (x_i < 0.0).float() * (~is_current).float()
+                prox = torch.clamp(1.0 - dist_i / 1.5, 0.0, 1.0)
+                exit_repulsion += on_exit * prox
+        else:
+            exit_repulsion = torch.zeros(self.num_envs, device=self.device)
 
         # TODO ----- END -----
 

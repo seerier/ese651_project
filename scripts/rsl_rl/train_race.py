@@ -134,11 +134,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     ang_vel_penalty_reward_scale = -0.01
 
     # Wrong-side proximity: dense penalty for approaching gate from exit side.
-    wrong_side_prox_reward_scale = -2.0
+    # Reduced from -2.0 to -0.5: gentler nudge avoids creating a fear barrier at gate planes.
+    # 3-stage curriculum in strategies.py disables this entirely for iter 0-500.
+    wrong_side_prox_reward_scale = -0.5
 
     # Exit repulsion: repulsive penalty near exit side of ALL gates (not just current target).
     # Prevents brush-and-turn exploit at gates 2→3 and elsewhere.
-    exit_repulsion_reward_scale = -3.0
+    # Reduced from -3.0 to -0.5: soft discouragement, not a wall.
+    exit_repulsion_reward_scale = -0.5
 
     rewards = {
         'gate_pass_reward_scale':        gate_pass_reward_scale,
