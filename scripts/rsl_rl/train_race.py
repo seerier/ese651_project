@@ -119,7 +119,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     crash_reward = -0.5
 
     # Death cost: terminal penalty on fatal termination.
-    death_cost = -15.0
+    # Reduced from -15 to -5: cheap death encourages exploration of risky zones
+    # (e.g. powerloop after gate 2) while wrong_side (-15) stays expensive.
+    death_cost = -5.0
 
     # Wrong-side gate entry: heavy penalty + episode termination to prevent DQ.
     wrong_side_reward_scale = -15.0
