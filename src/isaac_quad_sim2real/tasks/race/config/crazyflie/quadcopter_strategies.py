@@ -243,10 +243,14 @@ class DefaultQuadcopterStrategy:
                 drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
             )
         progress = (self.env._last_distance_to_goal - dist_to_gate).clamp(-5.0, 5.0)
-        # Boost progress during powerloop: 3x stronger pull toward virtual WP
-        # to overcome horizontal momentum after passing gate 2
+        # Asymmetric powerloop progress: reward getting closer to VP (3x boost),
+        # but DON'T punish getting farther (clamp to 0). The drone needs a
+        # penalty-free grace period to cancel downward momentum from gate 1→2
+        # descent before the upward arc begins. Without this clamp, the 3x
+        # boost amplifies negative progress to ~-30/step, making crashing
+        # cheaper than attempting the powerloop.
         if in_powerloop.any():
-            progress[in_powerloop] *= 3.0
+            progress[in_powerloop] = progress[in_powerloop].clamp(min=0.0) * 3.0
         self.env._last_distance_to_goal = dist_to_gate.clone()
 
         # --- Velocity-toward-gate reward ---
@@ -259,9 +263,12 @@ class DefaultQuadcopterStrategy:
         dist_for_vel = torch.norm(vec_to_gate, dim=1, keepdim=True).clamp(min=1e-6)
         dir_to_gate = vec_to_gate / dist_for_vel
         vel_toward_gate = (lin_vel_w * dir_to_gate).sum(dim=1).clamp(-5.0, 10.0)
-        # Boost velocity reward during powerloop: 2x to encourage fast execution
+        # Asymmetric powerloop velocity: reward velocity toward VP (2x boost),
+        # but don't punish velocity away from it. Same rationale as progress:
+        # the drone has downward momentum after gate 2 and needs cost-free time
+        # to redirect upward.
         if in_powerloop.any():
-            vel_toward_gate[in_powerloop] *= 2.0
+            vel_toward_gate[in_powerloop] = vel_toward_gate[in_powerloop].clamp(min=0.0) * 2.0
 
         # --- Crash detection: sustained contact force for > 100 timesteps ---
         contact_forces = self.env._contact_sensor.data.net_forces_w
@@ -626,6 +633,35 @@ class DefaultQuadcopterStrategy:
                     yaw_gs,
                 )
                 default_root_state[gs_ids, 3:7] = quat_gs
+
+            # ----------------------------------------------------------------
+            # Powerloop starts: 30% of resets spawn near gate 2 exit with
+            # target=gate 3. This gives ~2500 envs/iteration practicing the
+            # powerloop directly, vs the handful that reach it organically.
+            # 0.375 of non-ground resets ≈ 30% of total (20% ground + 30% PL + 50% normal).
+            # ----------------------------------------------------------------
+            powerloop_mask = (~ground_start_mask) & (torch.rand(n_reset, device=self.device) < 0.375)
+            pl_ids = powerloop_mask.nonzero(as_tuple=True)[0]
+            n_pl = len(pl_ids)
+            if n_pl > 0:
+                waypoint_indices[pl_ids] = 3  # target gate 3
+                gate2_pos = self.env._waypoints[2, :3]
+                # Spawn just past gate 2 exit with slight offsets
+                default_root_state[pl_ids, 0] = gate2_pos[0] + torch.empty(n_pl, device=self.device).uniform_(-0.3, 0.3)
+                default_root_state[pl_ids, 1] = gate2_pos[1] + torch.empty(n_pl, device=self.device).uniform_(-0.8, -0.1)
+                default_root_state[pl_ids, 2] = torch.empty(n_pl, device=self.device).uniform_(0.5, 1.2)
+                # Realistic post-gate-2 velocity: -Y momentum, varied Z
+                default_root_state[pl_ids, 7] = 0.0
+                default_root_state[pl_ids, 8] = torch.empty(n_pl, device=self.device).uniform_(-2.0, -0.5)
+                default_root_state[pl_ids, 9] = torch.empty(n_pl, device=self.device).uniform_(-1.0, 1.0)
+                default_root_state[pl_ids, 10:] = 0.0
+                yaw_pl = torch.empty(n_pl, device=self.device).uniform_(-0.5, 0.5)
+                quat_pl = quat_from_euler_xyz(
+                    torch.zeros(n_pl, device=self.device),
+                    torch.zeros(n_pl, device=self.device),
+                    yaw_pl,
+                )
+                default_root_state[pl_ids, 3:7] = quat_pl
 
         # TODO ----- END -----
 
