@@ -113,7 +113,7 @@ class DefaultQuadcopterStrategy:
             gate_normals = self.env._normal_vectors[passed_gate_idx]  # (K, 3)
             vel_at_pass = lin_vel_w[ids_gate_passed]
             # Speed through gate = dot(velocity, gate_normal), clamp positive
-            speed_through = (vel_at_pass * gate_normals).sum(dim=1).clamp(0.0, 10.0)
+            speed_through = (-vel_at_pass * gate_normals).sum(dim=1).clamp(0.0, 10.0)
             gate_pass_speed_bonus[ids_gate_passed] = speed_through
 
         # Advance waypoint index and update counters for envs that passed a gate
@@ -168,7 +168,17 @@ class DefaultQuadcopterStrategy:
         )
 
         # --- Wrong-side entry terminates episode (matches eval DQ rule) ---
-        self.env.reset_terminated = self.env.reset_terminated | wrong_side_entry
+        # Curriculum: only terminate after iteration 1000 so early training can learn multi-gate flight
+        if self.env.iteration >= 1000:
+            self.env.reset_terminated = self.env.reset_terminated | wrong_side_entry
+
+        # --- Wrong-side proximity: dense penalty for being on exit side of current gate ---
+        # curr_x < 0 means drone is on the exit side of the current target gate.
+        # Penalty scales with proximity: strongest near the gate, zero beyond 3m.
+        on_wrong_side = (curr_x < 0.0).float()
+        on_wrong_side[ids_gate_passed] = 0.0  # don't penalize correct gate passages
+        proximity_scale = torch.clamp(1.0 - dist_to_gate / 3.0, 0.0, 1.0)
+        wrong_side_proximity = on_wrong_side * proximity_scale
 
         # TODO ----- END -----
 
@@ -183,6 +193,7 @@ class DefaultQuadcopterStrategy:
                 "gate_speed_bonus": gate_pass_speed_bonus       * self.env.rew['gate_speed_bonus_reward_scale'],
                 "time_penalty":     time_penalty                * self.env.rew['time_penalty_reward_scale'],
                 "ang_vel_penalty":  ang_vel_penalty              * self.env.rew['ang_vel_penalty_reward_scale'],
+                "wrong_side_prox":  wrong_side_proximity         * self.env.rew['wrong_side_prox_reward_scale'],
             }
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
             reward = torch.where(self.env.reset_terminated,
@@ -235,7 +246,7 @@ class DefaultQuadcopterStrategy:
 
         # Gate normal direction in body frame: tells agent which direction to fly through gate.
         # Essential for disambiguating gates 3 vs 6 (same physical gate, opposite directions).
-        gate_normal_w = self.env._normal_vectors[self.env._idx_wp]  # (N, 3)
+        gate_normal_w = -self.env._normal_vectors[self.env._idx_wp]  # (N, 3) negated: points in traversal direction
         gate_normal_b = torch.bmm(
             rot_mat_obs.transpose(1, 2), gate_normal_w.unsqueeze(-1)
         ).squeeze(-1)  # (N, 3)

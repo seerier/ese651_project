@@ -133,6 +133,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Angular velocity penalty: penalize excessive body rates for stability.
     ang_vel_penalty_reward_scale = -0.01
 
+    # Wrong-side proximity: dense penalty for approaching gate from exit side.
+    wrong_side_prox_reward_scale = -2.0
+
     rewards = {
         'gate_pass_reward_scale':        gate_pass_reward_scale,
         'progress_goal_reward_scale':    progress_goal_reward_scale,
@@ -143,6 +146,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         'gate_speed_bonus_reward_scale': gate_speed_bonus_reward_scale,
         'time_penalty_reward_scale':     time_penalty_reward_scale,
         'ang_vel_penalty_reward_scale':  ang_vel_penalty_reward_scale,
+        'wrong_side_prox_reward_scale':  wrong_side_prox_reward_scale,
     }
     # TODO ----- END -----
 
