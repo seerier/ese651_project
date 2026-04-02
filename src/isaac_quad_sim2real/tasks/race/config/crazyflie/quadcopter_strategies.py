@@ -61,6 +61,9 @@ class DefaultQuadcopterStrategy:
             self._episode_sums["powerloop_active"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             self._episode_sums["powerloop_progress"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
+        # Track powerloop state for transition spike fix (Fix 3)
+        self._was_in_powerloop = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # Initialize fixed parameters once (no domain randomization)
         # These parameters remain constant throughout the simulation
         # Aerodynamic drag coefficients
@@ -111,14 +114,15 @@ class DefaultQuadcopterStrategy:
         ids_gate_passed = torch.where(gate_passed)[0]
 
         # --- Wrong-side gate entry: crossed from negative to positive x (DQ in eval!) ---
-        # Distance-based check: 1.2m catches any real wrong-side pass (max aperture
+        # Distance-based check: 1.0m catches any real wrong-side pass (max aperture
         # corner distance ~0.85m) while allowing the powerloop Y=0 crossing at Z≈2.0
-        # (min distance to gate 3 at Z=2.0 is 1.25m > 1.2m).
+        # (min distance to gate 3 at Z=2.0 is 1.25m > 1.0m, margin=0.25m).
+        # Also prevents false DQ at gate 2 during chicane 5→6 (dist=1.25m > 1.0m).
         dist_to_target_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
         wrong_side_entry = (
             (prev_x < 0.0)
             & (curr_x >= 0.0)
-            & (dist_to_target_gate < 1.2)
+            & (dist_to_target_gate < 1.0)
         )
 
         # --- All-gate wrong-side detection: catch reverse passes through ANY gate ---
@@ -149,7 +153,7 @@ class DefaultQuadcopterStrategy:
             wrong_side_i = (
                 (self._prev_x_all_gates[:, i] < 0.0)
                 & (curr_x_i >= 0.0)
-                & (dist_to_gate_i < 1.2)
+                & (dist_to_gate_i < 1.0)
                 & (~is_current)
                 & (~is_colocated_with_target)
             )
@@ -209,7 +213,7 @@ class DefaultQuadcopterStrategy:
                 powerloop_wp = (gate2_pos + gate3_pos) / 2.0
                 powerloop_wp = powerloop_wp.clone()
                 powerloop_wp[1] -= 0.5  # Align with post-gate-2 -Y momentum
-                powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.2m wrong-side zone)
+                powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.0m wrong-side zone)
                 drone_pos_pl = self.env._robot.data.root_link_pos_w[entering_powerloop, :3]
                 self.env._last_distance_to_goal[entering_powerloop] = torch.linalg.norm(
                     drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
@@ -218,55 +222,83 @@ class DefaultQuadcopterStrategy:
         # Update prev_x for envs that did NOT just pass a gate
         self.env._prev_x_drone_wrt_gate[~gate_passed] = curr_x[~gate_passed]
 
-        # --- Virtual powerloop waypoint ---
+        # --- Two-phase virtual powerloop waypoint ---
         # After passing gate 2, the direct path to gate 3 goes through its wrong side.
-        # When the drone targets gate 3 and is on the exit/wrong side (gate-frame x < 0),
-        # redirect progress and velocity rewards toward a waypoint 2m above the midpoint.
-        # This guides the drone UP (powerloop arc) instead of into gate 3's wrong side.
+        # Phase 1 (ascent): guide drone UP to VP above gates 2-3 midpoint.
+        # Phase 2 (descent): once near VP, guide drone DOWN to gate 3's approach side.
+        # This creates a continuous reward gradient: gate 2 exit → VP → descent WP → gate 3.
         gate2_pos = self.env._waypoints[2, :3]
         gate3_pos = self.env._waypoints[3, :3]
         powerloop_wp = (gate2_pos + gate3_pos) / 2.0
         powerloop_wp = powerloop_wp.clone()
         powerloop_wp[1] -= 0.5  # Align with post-gate-2 -Y momentum
-        powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.2m wrong-side zone)
+        powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.0m wrong-side zone)
+
+        # Descent waypoint: on gate 3's approach side (+Y), slightly above gate height
+        descent_wp = gate3_pos.clone()
+        descent_wp[1] += 0.3   # +Y = approach side for yaw=90° gate
+        descent_wp[2] += 0.3   # slightly above gate for smooth descent
 
         is_target_gate3 = (self.env._idx_wp == 3)
         gate3_frame_x = self.env._pose_drone_wrt_gate[:, 0]
         in_powerloop = is_target_gate3 & (gate3_frame_x < 0.0)
 
+        # Two-phase split: phase 2 activates when near VP and high enough
+        drone_pos_w_all = self.env._robot.data.root_link_pos_w[:, :3]
+        dist_to_vp = torch.linalg.norm(drone_pos_w_all - powerloop_wp.unsqueeze(0), dim=1)
+        near_vp = (dist_to_vp < 1.0) & (drone_pos_w_all[:, 2] > 1.5)
+        in_powerloop_phase2 = in_powerloop & near_vp
+        in_powerloop_phase1 = in_powerloop & ~near_vp
+
+        # Fix 3: detect PL→normal transition to prevent progress spike
+        just_exited_pl = self._was_in_powerloop & (~in_powerloop)
+
         # --- Dense potential-based progress reward ---
         dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
-        # Override distance for powerloop envs: measure to virtual waypoint
-        if in_powerloop.any():
-            drone_pos_pl = self.env._robot.data.root_link_pos_w[in_powerloop, :3]
-            dist_to_gate[in_powerloop] = torch.linalg.norm(
-                drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
+        # Phase 1: measure to VP (ascent)
+        if in_powerloop_phase1.any():
+            drone_pos_pl1 = drone_pos_w_all[in_powerloop_phase1]
+            dist_to_gate[in_powerloop_phase1] = torch.linalg.norm(
+                drone_pos_pl1 - powerloop_wp.unsqueeze(0), dim=1
             )
+        # Phase 2: measure to descent WP (guides drone to gate 3 approach side)
+        if in_powerloop_phase2.any():
+            drone_pos_pl2 = drone_pos_w_all[in_powerloop_phase2]
+            dist_to_gate[in_powerloop_phase2] = torch.linalg.norm(
+                drone_pos_pl2 - descent_wp.unsqueeze(0), dim=1
+            )
+
+        # Fix 3: reinit last_distance when exiting powerloop to prevent spike
+        if just_exited_pl.any():
+            self.env._last_distance_to_goal[just_exited_pl] = dist_to_gate[just_exited_pl]
+
         progress = (self.env._last_distance_to_goal - dist_to_gate).clamp(-5.0, 5.0)
-        # Asymmetric powerloop progress: reward getting closer to VP (3x boost),
-        # but DON'T punish getting farther (clamp to 0). The drone needs a
-        # penalty-free grace period to cancel downward momentum from gate 1→2
-        # descent before the upward arc begins. Without this clamp, the 3x
-        # boost amplifies negative progress to ~-30/step, making crashing
-        # cheaper than attempting the powerloop.
+        # Fix 4: save raw progress sign BEFORE clamping (for anti-ratchet)
+        raw_progress_positive = (progress > 0)
+        # Asymmetric powerloop progress: reward getting closer (3x boost),
+        # don't punish getting farther (clamp to 0). Grace period for
+        # canceling downward momentum from gate 1→2 descent.
         if in_powerloop.any():
             progress[in_powerloop] = progress[in_powerloop].clamp(min=0.0) * 3.0
-        self.env._last_distance_to_goal = dist_to_gate.clone()
+        # Fix 4: anti-ratchet — only update baseline when making real progress
+        # Prevents: move away (0 cost, baseline inflates) → move back (free reward)
+        update_last_dist = ~in_powerloop | (in_powerloop & raw_progress_positive)
+        self.env._last_distance_to_goal[update_last_dist] = dist_to_gate[update_last_dist].clone()
 
         # --- Velocity-toward-gate reward ---
         gate_pos_w  = self.env._waypoints[self.env._idx_wp, :3].clone()
-        # Override target for powerloop envs: velocity toward virtual waypoint
-        if in_powerloop.any():
-            gate_pos_w[in_powerloop] = powerloop_wp.unsqueeze(0)
+        # Override target for powerloop envs (two-phase)
+        if in_powerloop_phase1.any():
+            gate_pos_w[in_powerloop_phase1] = powerloop_wp.unsqueeze(0)
+        if in_powerloop_phase2.any():
+            gate_pos_w[in_powerloop_phase2] = descent_wp.unsqueeze(0)
         drone_pos_w = self.env._robot.data.root_link_pos_w
         vec_to_gate = gate_pos_w - drone_pos_w
         dist_for_vel = torch.norm(vec_to_gate, dim=1, keepdim=True).clamp(min=1e-6)
         dir_to_gate = vec_to_gate / dist_for_vel
         vel_toward_gate = (lin_vel_w * dir_to_gate).sum(dim=1).clamp(-5.0, 10.0)
-        # Asymmetric powerloop velocity: reward velocity toward VP (2x boost),
-        # but don't punish velocity away from it. Same rationale as progress:
-        # the drone has downward momentum after gate 2 and needs cost-free time
-        # to redirect upward.
+        # Asymmetric powerloop velocity: reward velocity toward target (2x boost),
+        # don't punish velocity away (grace period for momentum cancellation).
         if in_powerloop.any():
             vel_toward_gate[in_powerloop] = vel_toward_gate[in_powerloop].clamp(min=0.0) * 2.0
 
@@ -340,8 +372,12 @@ class DefaultQuadcopterStrategy:
                 "exit_repulsion":   exit_repulsion               * self.env.rew['exit_repulsion_reward_scale'],
             }
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
-            reward = torch.where(self.env.reset_terminated,
-                                torch.ones_like(reward) * self.env.rew['death_cost'], reward)
+            # Fix 1: wrong-side deaths get death_cost + wrong_side penalty (-5 + -15 = -20)
+            # Other deaths get just death_cost (-5). Previously, wrong_side -15 was
+            # computed but overwritten by death_cost, making wrong-side = normal death.
+            terminal_reward = (self.env.rew['death_cost']
+                               + wrong_side_entry.float() * self.env.rew['wrong_side_reward_scale'])
+            reward = torch.where(self.env.reset_terminated, terminal_reward, reward)
 
             # Logging
             for key, value in rewards.items():
@@ -355,6 +391,9 @@ class DefaultQuadcopterStrategy:
         else:   # This else condition implies eval is called with play_race.py. Can be useful to debug at test-time
             reward = torch.zeros(self.num_envs, device=self.device)
             # TODO ----- END -----
+
+        # Fix 3: track powerloop state for next step's transition detection
+        self._was_in_powerloop = in_powerloop.clone()
 
         return reward
 
@@ -705,9 +744,6 @@ class DefaultQuadcopterStrategy:
         self.env._desired_pos_w[env_ids, :2] = self.env._waypoints[waypoint_indices, :2].clone()
         self.env._desired_pos_w[env_ids, 2] = self.env._waypoints[waypoint_indices, 2].clone()
 
-        self.env._last_distance_to_goal[env_ids] = torch.linalg.norm(
-            self.env._desired_pos_w[env_ids, :2] - self.env._robot.data.root_link_pos_w[env_ids, :2], dim=1
-        )
         self.env._n_gates_passed[env_ids] = 0
 
         # Write state to simulation
@@ -723,7 +759,30 @@ class DefaultQuadcopterStrategy:
             self.env._robot.data.root_link_state_w[env_ids, :3]
         )
 
+        # Fix 7: use 3D gate-frame distance (AFTER pose recomputation)
+        self.env._last_distance_to_goal[env_ids] = torch.linalg.norm(
+            self.env._pose_drone_wrt_gate[env_ids], dim=1
+        )
+
+        # Fix 7b: for powerloop spawns (target=gate3), init distance to VP
+        if self.cfg.is_train and isinstance(waypoint_indices, torch.Tensor):
+            is_gate3 = (waypoint_indices == 3)
+            if is_gate3.any():
+                gate2_pos = self.env._waypoints[2, :3]
+                gate3_pos = self.env._waypoints[3, :3]
+                vp = (gate2_pos + gate3_pos) / 2.0
+                vp = vp.clone()
+                vp[1] -= 0.5
+                vp[2] += 1.25
+                g3_ids = env_ids[is_gate3]
+                drone_pos_g3 = self.env._robot.data.root_link_state_w[g3_ids, :3]
+                self.env._last_distance_to_goal[g3_ids] = torch.linalg.norm(
+                    drone_pos_g3 - vp.unsqueeze(0), dim=1
+                )
+
         self.env._prev_x_drone_wrt_gate[env_ids] = 1.0
         self._prev_x_all_gates[env_ids] = 1.0
+        # Fix 3: reset powerloop transition tracker
+        self._was_in_powerloop[env_ids] = False
 
         self.env._crashed[env_ids] = 0
