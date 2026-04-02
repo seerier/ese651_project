@@ -58,11 +58,13 @@ class DefaultQuadcopterStrategy:
                 for key in keys
             }
             # Extra monitoring metrics (not rewards, just diagnostics)
-            self._episode_sums["powerloop_active"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            self._episode_sums["powerloop_progress"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self._episode_sums["arc_active"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self._episode_sums["arc_progress"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
-        # Track powerloop state for transition spike fix (Fix 3)
-        self._was_in_powerloop = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Track horizontal arc state for transition spike fix
+        self._was_in_arc = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._arc_phase = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._prev_arc_phase = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # Initialize fixed parameters once (no domain randomization)
         # These parameters remain constant throughout the simulation
@@ -115,8 +117,8 @@ class DefaultQuadcopterStrategy:
 
         # --- Wrong-side gate entry: crossed from negative to positive x (DQ in eval!) ---
         # Distance-based check: 1.0m catches any real wrong-side pass (max aperture
-        # corner distance ~0.85m) while allowing the powerloop Y=0 crossing at Z≈2.0
-        # (min distance to gate 3 at Z=2.0 is 1.25m > 1.0m, margin=0.25m).
+        # corner distance ~0.85m) while allowing the horizontal arc Y=0 crossing at
+        # X≈1.8 (distance to gate 3 = 1.175m > 1.0m, margin=0.175m).
         # Also prevents false DQ at gate 2 during chicane 5→6 (dist=1.25m > 1.0m).
         dist_to_target_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
         wrong_side_entry = (
@@ -202,105 +204,94 @@ class DefaultQuadcopterStrategy:
                 new_pose, dim=1
             )
 
-            # Powerloop: for envs that just advanced to gate 3, override
-            # _last_distance_to_goal to use the virtual waypoint so the
-            # progress reward guides the drone UP, not directly at gate 3.
+            # Horizontal arc: for envs that just advanced to gate 3, override
+            # _last_distance_to_goal to use ARC_WP1 so the progress reward
+            # guides the drone into the clockwise horizontal arc.
             new_targets = self.env._idx_wp[ids_gate_passed]
-            entering_powerloop = ids_gate_passed[new_targets == 3]
-            if len(entering_powerloop) > 0:
-                gate2_pos = self.env._waypoints[2, :3]
-                gate3_pos = self.env._waypoints[3, :3]
-                powerloop_wp = (gate2_pos + gate3_pos) / 2.0
-                powerloop_wp = powerloop_wp.clone()
-                powerloop_wp[1] -= 0.5  # Align with post-gate-2 -Y momentum
-                powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.0m wrong-side zone)
-                drone_pos_pl = self.env._robot.data.root_link_pos_w[entering_powerloop, :3]
-                self.env._last_distance_to_goal[entering_powerloop] = torch.linalg.norm(
-                    drone_pos_pl - powerloop_wp.unsqueeze(0), dim=1
+            entering_arc = ids_gate_passed[new_targets == 3]
+            if len(entering_arc) > 0:
+                arc_wp1_init = torch.tensor([0.6, -0.6, 0.75], device=self.device)
+                drone_pos_arc = self.env._robot.data.root_link_pos_w[entering_arc, :3]
+                self.env._last_distance_to_goal[entering_arc] = torch.linalg.norm(
+                    drone_pos_arc - arc_wp1_init.unsqueeze(0), dim=1
                 )
 
         # Update prev_x for envs that did NOT just pass a gate
         self.env._prev_x_drone_wrt_gate[~gate_passed] = curr_x[~gate_passed]
 
-        # --- Two-phase virtual powerloop waypoint ---
-        # After passing gate 2, the direct path to gate 3 goes through its wrong side.
-        # Phase 1 (ascent): guide drone UP to VP above gates 2-3 midpoint.
-        # Phase 2 (descent): once near VP, guide drone DOWN to gate 3's approach side.
-        # This creates a continuous reward gradient: gate 2 exit → VP → descent WP → gate 3.
-        gate2_pos = self.env._waypoints[2, :3]
-        gate3_pos = self.env._waypoints[3, :3]
-        powerloop_wp = (gate2_pos + gate3_pos) / 2.0
-        powerloop_wp = powerloop_wp.clone()
-        powerloop_wp[1] -= 0.5  # Align with post-gate-2 -Y momentum
-        powerloop_wp[2] += 1.25  # Z=2.0 (1.0m ceiling margin, clears 1.0m wrong-side zone)
-
-        # Descent waypoint: on gate 3's approach side (+Y), slightly above gate height
-        descent_wp = gate3_pos.clone()
-        descent_wp[1] += 0.3   # +Y = approach side for yaw=90° gate
-        descent_wp[2] += 0.3   # slightly above gate for smooth descent
+        # --- Three-phase horizontal arc waypoints ---
+        # After gate 2 exit (drone at Y<0), sweep clockwise at Z≈0.75
+        # to gate 3's approach side (Y>0). Three waypoints guide the arc:
+        #   WP1: pull rightward into arc start
+        #   WP2: Y=0 crossing at safe X distance from gates
+        #   WP3: gate 3 approach setup from +Y side
+        arc_wp1 = torch.tensor([0.6, -0.6, 0.75], device=self.device)
+        arc_wp2 = torch.tensor([1.8,  0.0, 0.75], device=self.device)
+        arc_wp3 = torch.tensor([0.625, 0.5, 0.75], device=self.device)
 
         is_target_gate3 = (self.env._idx_wp == 3)
         gate3_frame_x = self.env._pose_drone_wrt_gate[:, 0]
-        in_powerloop = is_target_gate3 & (gate3_frame_x < 0.0)
+        in_arc = is_target_gate3 & (gate3_frame_x < 0.0)
 
-        # Two-phase split: phase 2 activates when near VP and high enough
+        # Phase advancement: distance-based with forward-only ratchet
         drone_pos_w_all = self.env._robot.data.root_link_pos_w[:, :3]
-        dist_to_vp = torch.linalg.norm(drone_pos_w_all - powerloop_wp.unsqueeze(0), dim=1)
-        near_vp = (dist_to_vp < 1.0) & (drone_pos_w_all[:, 2] > 1.5)
-        in_powerloop_phase2 = in_powerloop & near_vp
-        in_powerloop_phase1 = in_powerloop & ~near_vp
+        dist_to_arc_wp1 = torch.linalg.norm(drone_pos_w_all - arc_wp1.unsqueeze(0), dim=1)
+        dist_to_arc_wp2 = torch.linalg.norm(drone_pos_w_all - arc_wp2.unsqueeze(0), dim=1)
+        near_wp1 = (dist_to_arc_wp1 < 0.5)
+        near_wp2 = (dist_to_arc_wp2 < 0.6) & (drone_pos_w_all[:, 1] >= -0.1)
 
-        # Fix 3: detect PL→normal transition to prevent progress spike
-        just_exited_pl = self._was_in_powerloop & (~in_powerloop)
+        new_phase = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        new_phase[in_arc & ~near_wp1] = 1
+        new_phase[in_arc & near_wp1 & ~near_wp2] = 2
+        new_phase[in_arc & near_wp2] = 3
+        self._arc_phase = torch.where(in_arc, torch.max(self._arc_phase, new_phase),
+                                      torch.zeros_like(self._arc_phase))
+
+        in_arc_phase1 = in_arc & (self._arc_phase == 1)
+        in_arc_phase2 = in_arc & (self._arc_phase == 2)
+        in_arc_phase3 = in_arc & (self._arc_phase == 3)
+
+        # Detect arc→normal transition and phase advances for spike prevention
+        just_exited_arc = self._was_in_arc & (~in_arc)
+        phase_just_advanced = in_arc & (self._arc_phase > self._prev_arc_phase)
 
         # --- Dense potential-based progress reward ---
         dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
-        # Phase 1: measure to VP (ascent)
-        if in_powerloop_phase1.any():
-            drone_pos_pl1 = drone_pos_w_all[in_powerloop_phase1]
-            dist_to_gate[in_powerloop_phase1] = torch.linalg.norm(
-                drone_pos_pl1 - powerloop_wp.unsqueeze(0), dim=1
-            )
-        # Phase 2: measure to descent WP (guides drone to gate 3 approach side)
-        if in_powerloop_phase2.any():
-            drone_pos_pl2 = drone_pos_w_all[in_powerloop_phase2]
-            dist_to_gate[in_powerloop_phase2] = torch.linalg.norm(
-                drone_pos_pl2 - descent_wp.unsqueeze(0), dim=1
-            )
+        if in_arc_phase1.any():
+            dist_to_gate[in_arc_phase1] = torch.linalg.norm(
+                drone_pos_w_all[in_arc_phase1] - arc_wp1.unsqueeze(0), dim=1)
+        if in_arc_phase2.any():
+            dist_to_gate[in_arc_phase2] = torch.linalg.norm(
+                drone_pos_w_all[in_arc_phase2] - arc_wp2.unsqueeze(0), dim=1)
+        if in_arc_phase3.any():
+            dist_to_gate[in_arc_phase3] = torch.linalg.norm(
+                drone_pos_w_all[in_arc_phase3] - arc_wp3.unsqueeze(0), dim=1)
 
-        # Fix 3: reinit last_distance when exiting powerloop to prevent spike
-        if just_exited_pl.any():
-            self.env._last_distance_to_goal[just_exited_pl] = dist_to_gate[just_exited_pl]
+        # Reinit last_distance on arc exit and phase transitions to prevent spike
+        if just_exited_arc.any():
+            self.env._last_distance_to_goal[just_exited_arc] = dist_to_gate[just_exited_arc]
+        if phase_just_advanced.any():
+            self.env._last_distance_to_goal[phase_just_advanced] = dist_to_gate[phase_just_advanced]
 
         progress = (self.env._last_distance_to_goal - dist_to_gate).clamp(-5.0, 5.0)
-        # Fix 4: save raw progress sign BEFORE clamping (for anti-ratchet)
-        raw_progress_positive = (progress > 0)
-        # Asymmetric powerloop progress: reward getting closer (3x boost),
-        # don't punish getting farther (clamp to 0). Grace period for
-        # canceling downward momentum from gate 1→2 descent.
-        if in_powerloop.any():
-            progress[in_powerloop] = progress[in_powerloop].clamp(min=0.0) * 3.0
-        # Fix 4: anti-ratchet — only update baseline when making real progress
-        # Prevents: move away (0 cost, baseline inflates) → move back (free reward)
-        update_last_dist = ~in_powerloop | (in_powerloop & raw_progress_positive)
-        self.env._last_distance_to_goal[update_last_dist] = dist_to_gate[update_last_dist].clone()
+        # Symmetric 1.5x arc boost: backtracking IS penalized (no ratchet exploit)
+        if in_arc.any():
+            progress[in_arc] = progress[in_arc] * 1.5
+        self.env._last_distance_to_goal = dist_to_gate.clone()
 
         # --- Velocity-toward-gate reward ---
-        gate_pos_w  = self.env._waypoints[self.env._idx_wp, :3].clone()
-        # Override target for powerloop envs (two-phase)
-        if in_powerloop_phase1.any():
-            gate_pos_w[in_powerloop_phase1] = powerloop_wp.unsqueeze(0)
-        if in_powerloop_phase2.any():
-            gate_pos_w[in_powerloop_phase2] = descent_wp.unsqueeze(0)
+        gate_pos_w = self.env._waypoints[self.env._idx_wp, :3].clone()
+        if in_arc_phase1.any():
+            gate_pos_w[in_arc_phase1] = arc_wp1.unsqueeze(0)
+        if in_arc_phase2.any():
+            gate_pos_w[in_arc_phase2] = arc_wp2.unsqueeze(0)
+        if in_arc_phase3.any():
+            gate_pos_w[in_arc_phase3] = arc_wp3.unsqueeze(0)
         drone_pos_w = self.env._robot.data.root_link_pos_w
         vec_to_gate = gate_pos_w - drone_pos_w
         dist_for_vel = torch.norm(vec_to_gate, dim=1, keepdim=True).clamp(min=1e-6)
         dir_to_gate = vec_to_gate / dist_for_vel
         vel_toward_gate = (lin_vel_w * dir_to_gate).sum(dim=1).clamp(-5.0, 10.0)
-        # Asymmetric powerloop velocity: reward velocity toward target (2x boost),
-        # don't punish velocity away (grace period for momentum cancellation).
-        if in_powerloop.any():
-            vel_toward_gate[in_powerloop] = vel_toward_gate[in_powerloop].clamp(min=0.0) * 2.0
 
         # --- Crash detection: sustained contact force for > 100 timesteps ---
         contact_forces = self.env._contact_sensor.data.net_forces_w
@@ -382,18 +373,19 @@ class DefaultQuadcopterStrategy:
             # Logging
             for key, value in rewards.items():
                 self._episode_sums[key] += value
-            # Powerloop diagnostics: track how often the drone is in powerloop mode
-            # and the progress it makes toward the virtual waypoint while in it
-            self._episode_sums["powerloop_active"] += in_powerloop.float()
-            powerloop_progress_step = torch.zeros(self.num_envs, device=self.device)
-            powerloop_progress_step[in_powerloop] = progress[in_powerloop]
-            self._episode_sums["powerloop_progress"] += powerloop_progress_step
+            # Arc diagnostics: track how often the drone is in arc mode
+            # and the progress it makes through the horizontal arc
+            self._episode_sums["arc_active"] += in_arc.float()
+            arc_progress_step = torch.zeros(self.num_envs, device=self.device)
+            arc_progress_step[in_arc] = progress[in_arc]
+            self._episode_sums["arc_progress"] += arc_progress_step
         else:   # This else condition implies eval is called with play_race.py. Can be useful to debug at test-time
             reward = torch.zeros(self.num_envs, device=self.device)
             # TODO ----- END -----
 
-        # Fix 3: track powerloop state for next step's transition detection
-        self._was_in_powerloop = in_powerloop.clone()
+        # Track arc state for next step's transition detection
+        self._was_in_arc = in_arc.clone()
+        self._prev_arc_phase = self._arc_phase.clone()
 
         return reward
 
@@ -425,7 +417,7 @@ class DefaultQuadcopterStrategy:
             self.env._robot.data.root_link_pos_w,
         )  # (N, 3)
 
-        # Second look-ahead (gate+2): critical for powerloop setup and chicane planning
+        # Second look-ahead (gate+2): critical for horizontal arc setup and chicane planning
         next_next_gate_idx = (self.env._idx_wp + 2) % num_gates_obs
         drone_pos_next_next_gate_frame, _ = subtract_frame_transforms(
             self.env._waypoints[next_next_gate_idx, :3],
@@ -674,33 +666,33 @@ class DefaultQuadcopterStrategy:
                 default_root_state[gs_ids, 3:7] = quat_gs
 
             # ----------------------------------------------------------------
-            # Powerloop starts: 30% of resets spawn near gate 2 exit with
-            # target=gate 3. This gives ~2500 envs/iteration practicing the
-            # powerloop directly, vs the handful that reach it organically.
-            # 0.375 of non-ground resets ≈ 30% of total (20% ground + 30% PL + 50% normal).
+            # Horizontal arc starts: 30% of resets spawn near gate 2 exit
+            # with target=gate 3. Velocity has +X (rightward into arc) and
+            # -Y (post-gate-2 momentum) components for the clockwise arc.
+            # 0.375 of non-ground resets ≈ 30% of total.
             # ----------------------------------------------------------------
-            powerloop_mask = (~ground_start_mask) & (torch.rand(n_reset, device=self.device) < 0.375)
-            pl_ids = powerloop_mask.nonzero(as_tuple=True)[0]
-            n_pl = len(pl_ids)
-            if n_pl > 0:
-                waypoint_indices[pl_ids] = 3  # target gate 3
+            arc_mask = (~ground_start_mask) & (torch.rand(n_reset, device=self.device) < 0.375)
+            arc_ids = arc_mask.nonzero(as_tuple=True)[0]
+            n_arc = len(arc_ids)
+            if n_arc > 0:
+                waypoint_indices[arc_ids] = 3  # target gate 3
                 gate2_pos = self.env._waypoints[2, :3]
                 # Spawn just past gate 2 exit with slight offsets
-                default_root_state[pl_ids, 0] = gate2_pos[0] + torch.empty(n_pl, device=self.device).uniform_(-0.3, 0.3)
-                default_root_state[pl_ids, 1] = gate2_pos[1] + torch.empty(n_pl, device=self.device).uniform_(-0.8, -0.1)
-                default_root_state[pl_ids, 2] = torch.empty(n_pl, device=self.device).uniform_(0.5, 1.2)
-                # Realistic post-gate-2 velocity: -Y momentum, varied Z
-                default_root_state[pl_ids, 7] = 0.0
-                default_root_state[pl_ids, 8] = torch.empty(n_pl, device=self.device).uniform_(-2.0, -0.5)
-                default_root_state[pl_ids, 9] = torch.empty(n_pl, device=self.device).uniform_(-1.0, 1.0)
-                default_root_state[pl_ids, 10:] = 0.0
-                yaw_pl = torch.empty(n_pl, device=self.device).uniform_(-0.5, 0.5)
-                quat_pl = quat_from_euler_xyz(
-                    torch.zeros(n_pl, device=self.device),
-                    torch.zeros(n_pl, device=self.device),
-                    yaw_pl,
+                default_root_state[arc_ids, 0] = gate2_pos[0] + torch.empty(n_arc, device=self.device).uniform_(-0.2, 0.4)
+                default_root_state[arc_ids, 1] = gate2_pos[1] + torch.empty(n_arc, device=self.device).uniform_(-0.8, -0.1)
+                default_root_state[arc_ids, 2] = torch.empty(n_arc, device=self.device).uniform_(0.5, 1.0)
+                # Post-gate-2 velocity: +X (rightward into arc) and -Y (through-gate momentum)
+                default_root_state[arc_ids, 7] = torch.empty(n_arc, device=self.device).uniform_(0.0, 1.5)
+                default_root_state[arc_ids, 8] = torch.empty(n_arc, device=self.device).uniform_(-2.0, -0.5)
+                default_root_state[arc_ids, 9] = torch.empty(n_arc, device=self.device).uniform_(-0.5, 0.5)
+                default_root_state[arc_ids, 10:] = 0.0
+                yaw_arc = torch.empty(n_arc, device=self.device).uniform_(-0.3, 0.8)  # biased toward +X
+                quat_arc = quat_from_euler_xyz(
+                    torch.zeros(n_arc, device=self.device),
+                    torch.zeros(n_arc, device=self.device),
+                    yaw_arc,
                 )
-                default_root_state[pl_ids, 3:7] = quat_pl
+                default_root_state[arc_ids, 3:7] = quat_arc
 
         # TODO ----- END -----
 
@@ -764,25 +756,22 @@ class DefaultQuadcopterStrategy:
             self.env._pose_drone_wrt_gate[env_ids], dim=1
         )
 
-        # Fix 7b: for powerloop spawns (target=gate3), init distance to VP
+        # For arc spawns (target=gate3), init distance to ARC_WP1
         if self.cfg.is_train and isinstance(waypoint_indices, torch.Tensor):
             is_gate3 = (waypoint_indices == 3)
             if is_gate3.any():
-                gate2_pos = self.env._waypoints[2, :3]
-                gate3_pos = self.env._waypoints[3, :3]
-                vp = (gate2_pos + gate3_pos) / 2.0
-                vp = vp.clone()
-                vp[1] -= 0.5
-                vp[2] += 1.25
+                arc_wp1_reset = torch.tensor([0.6, -0.6, 0.75], device=self.device)
                 g3_ids = env_ids[is_gate3]
                 drone_pos_g3 = self.env._robot.data.root_link_state_w[g3_ids, :3]
                 self.env._last_distance_to_goal[g3_ids] = torch.linalg.norm(
-                    drone_pos_g3 - vp.unsqueeze(0), dim=1
+                    drone_pos_g3 - arc_wp1_reset.unsqueeze(0), dim=1
                 )
 
         self.env._prev_x_drone_wrt_gate[env_ids] = 1.0
         self._prev_x_all_gates[env_ids] = 1.0
-        # Fix 3: reset powerloop transition tracker
-        self._was_in_powerloop[env_ids] = False
+        # Reset arc state trackers
+        self._was_in_arc[env_ids] = False
+        self._arc_phase[env_ids] = 0
+        self._prev_arc_phase[env_ids] = 0
 
         self.env._crashed[env_ids] = 0
