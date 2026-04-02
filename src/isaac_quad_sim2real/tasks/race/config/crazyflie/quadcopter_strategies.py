@@ -167,15 +167,13 @@ class DefaultQuadcopterStrategy:
             self.env._robot.data.root_ang_vel_b, dim=1
         )
 
-        # --- Wrong-side entry terminates episode (matches eval DQ rule) ---
-        # Curriculum: only delay termination during early training; always terminate during eval
-        if not self.cfg.is_train or self.env.iteration >= 1000:
-            self.env.reset_terminated = self.env.reset_terminated | wrong_side_entry
+        # --- Wrong-side entry always terminates episode (matches eval DQ rule) ---
+        self.env.reset_terminated = self.env.reset_terminated | wrong_side_entry
 
-        # --- Dense directional penalties: 3-stage curriculum ---
-        # Stage 1 (iter 0-500):   No dense penalties — drone learns to pass gates freely
-        # Stage 2 (iter 500-1000): Enable dense penalties — drone learns correct direction
-        # Stage 3 (iter 1000+):    + wrong-side termination (handled above)
+        # --- Dense directional penalties: curriculum ---
+        # Iter 0-500:  No dense penalties — drone learns to pass gates without fear barrier
+        # Iter 500+:   Enable dense penalties — drone learns correct approach direction
+        # Termination is always active above, so wrong-side exploit is impossible
         # During eval (is_train=False): always enable all penalties
         dense_penalty_active = (not self.cfg.is_train) or (self.env.iteration >= 500)
 
